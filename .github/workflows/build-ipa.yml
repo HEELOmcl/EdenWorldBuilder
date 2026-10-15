@@ -137,6 +137,17 @@ jobs:
              about icon-set completeness.  Using sips we generate every missing size from
              the largest icon already in the set, so the catalogue is complete.
 
+          6) `register` and UILineBreakMode / UITextAlignment (always on)
+             Clang 16 changed the default C++ dialect from gnu++98 to gnu++17, which broke
+             this 2010-era code twice over:
+               * `register int i, j;`            -- C++17 removed the `register` keyword
+               * `const int t[] = {0xFFFFF952,…}`-- C++11 made that narrowing an error
+             (the workflow pins CLANG_CXX_LANGUAGE_STANDARD=gnu++11 and passes
+             -Wno-c++11-narrowing for the second one).  Separately, UIKit renamed
+             UILineBreakMode -> NSLineBreakMode and UITextAlignment -> NSTextAlignment; the
+             old names survive as *distinct* types, so passing them to the modern APIs is a
+             hard error in Objective-C++.  Both renames are behaviour preserving.
+
           The script is idempotent: running it twice changes nothing.
           """
 
@@ -631,6 +642,63 @@ jobs:
                     % (", ".join(changed) if changed else "no file"))
 
 
+          # UIKit renamed these enum *types*; the old spellings still exist in the modern SDK
+          # but as distinct types, so passing them to the modern APIs is a hard error in
+          # Objective-C++ (it is only a warning in plain Objective-C).  The enumerator values
+          # are identical, so this rename is behaviour preserving.
+          LEGACY_UIKIT_ENUMS = [
+              ("UILineBreakModeWordWrap", "NSLineBreakModeByWordWrapping"),
+              ("UILineBreakModeCharacterWrap", "NSLineBreakModeByCharWrapping"),
+              ("UILineBreakModeClip", "NSLineBreakModeByClipping"),
+              ("UILineBreakModeHeadTruncation", "NSLineBreakModeByTruncatingHead"),
+              ("UILineBreakModeTailTruncation", "NSLineBreakModeByTruncatingTail"),
+              ("UILineBreakModeMiddleTruncation", "NSLineBreakModeByTruncatingMiddle"),
+              ("UILineBreakMode", "NSLineBreakMode"),
+              ("UITextAlignmentLeft", "NSTextAlignmentLeft"),
+              ("UITextAlignmentCenter", "NSTextAlignmentCenter"),
+              ("UITextAlignmentRight", "NSTextAlignmentRight"),
+              ("UITextAlignment", "NSTextAlignment"),
+          ]
+
+
+          def _project_sources(project_dir: Path):
+              exts = (".m", ".mm", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp")
+              found = [p for p in project_dir.glob("*") if p.suffix.lower() in exts]
+              for sub in ("Classes", "Eden", "iPad"):
+                  d = project_dir / sub
+                  if d.is_dir():
+                      found += [p for p in d.rglob("*") if p.suffix.lower() in exts]
+              return sorted(set(found))
+
+
+          def fix_legacy_uikit_enums(project_dir: Path, dry: bool):
+              """Rename UILineBreakMode*/UITextAlignment* to their NS* equivalents.
+
+              This is what makes `[string drawInRect:... lineBreakMode:UILineBreakModeWordWrap
+              alignment:alignment]` compile again: `error: cannot initialize a parameter of type
+              'NSLineBreakMode' with an rvalue of type 'UILineBreakMode'`.
+              """
+              changed, total = [], 0
+              for path in _project_sources(project_dir):
+                  try:
+                      src = read(path)
+                  except OSError:
+                      continue
+                  if "UITextAlignment" not in src and "UILineBreakMode" not in src:
+                      continue
+                  hits = 0
+                  for old, new in LEGACY_UIKIT_ENUMS:
+                      src, n = re.subn(r"\b" + re.escape(old) + r"\b", new, src)
+                      hits += n
+                  if hits:
+                      total += hits
+                      changed.append("%s (%d)" % (path.name, hits))
+                      if not dry:
+                          write(path, src)
+              print("- legacy UIKit enums: renamed %d occurrence(s) in %s"
+                    % (total, ", ".join(changed) if changed else "no file"))
+
+
           def disable_flurry(project_dir: Path, text: str, dry: bool):
               refs = parse_file_references(text)
               victims_ref = {i for i, r in refs.items()
@@ -706,6 +774,7 @@ jobs:
                   fix_app_icon(root, args.dry_run)
               if not args.no_legacy_cxx:
                   fix_legacy_cxx_sources(root, args.dry_run)
+              fix_legacy_uikit_enums(root, args.dry_run)
               if plist.is_file():
                   fix_info_plist(plist, args.dry_run)
               else:
