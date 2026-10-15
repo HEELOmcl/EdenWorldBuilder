@@ -31,6 +31,9 @@ on:
       runner:
         description: "GitHub 运行器标签。可选 macos-15 / macos-14 / macos-latest"
         default: "macos-15"
+      cxx_standard:
+        description: "C++ 标准。默认 gnu++11 是为老代码准备的；只有出问题时才改（gnu++98 / gnu++14）"
+        default: "gnu++11"
       disable_flurry:
         description: "仅当链接阶段报 Flurry 相关错误时勾选：移除 Flurry 分析库"
         type: boolean
@@ -589,6 +592,45 @@ jobs:
               write(cj, json.dumps(data, indent=2) + "\n")
 
 
+          def fix_legacy_cxx_sources(project_dir: Path, dry: bool):
+              """Strip the `register` storage class specifier.
+
+              Clang 16 changed the default C++ dialect from gnu++98 to gnu++17.  C++17
+              removed the `register` storage class outright, so `register int i, j;`
+              (TerrainGenerator.mm) is now a hard error.  The keyword has had no effect for
+              decades, so deleting it is semantically free.
+
+              The C++ files are additionally compiled as gnu++11 (see the workflow), and
+              `-Wno-c++11-narrowing` handles the const int[] tables in PVRTMathTable.h,
+              which C++11 rejects as narrowing conversions.
+              """
+              exts = (".m", ".mm", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp")
+              candidates = [p for p in project_dir.glob("*") if p.suffix.lower() in exts]
+              classes = project_dir / "Classes"
+              if classes.is_dir():
+                  candidates += [p for p in classes.rglob("*") if p.suffix.lower() in exts]
+
+              line_pat = re.compile(r"^([ \t]*)register[ \t]+", re.M)
+              loop_pat = re.compile(r"(\bfor[ \t]*\([^()]*?)register[ \t]+")
+
+              changed = []
+              for path in sorted(set(candidates)):
+                  try:
+                      src = read(path)
+                  except OSError:
+                      continue
+                  if "register" not in src:
+                      continue
+                  new, n1 = line_pat.subn(r"\1", src)
+                  new, n2 = loop_pat.subn(r"\1", new)
+                  if n1 + n2:
+                      changed.append("%s (%d)" % (path.name, n1 + n2))
+                      if not dry:
+                          write(path, new)
+              print("- legacy C++: removed 'register' storage class in %s"
+                    % (", ".join(changed) if changed else "no file"))
+
+
           def disable_flurry(project_dir: Path, text: str, dry: bool):
               refs = parse_file_references(text)
               victims_ref = {i for i, r in refs.items()
@@ -636,6 +678,8 @@ jobs:
                               help="fill empty AppIcon slots with sips (default, macOS only)")
               ap.add_argument("--no-fix-app-icon", dest="fix_app_icon", action="store_false",
                               help="do not touch the AppIcon asset catalogue")
+              ap.add_argument("--no-legacy-cxx", action="store_true",
+                              help="do not strip the C++17-removed 'register' keyword")
               ap.add_argument("--dry-run", action="store_true", help="report without writing")
               args = ap.parse_args()
 
@@ -660,6 +704,8 @@ jobs:
                   text = disable_flurry(root, text, args.dry_run)
               if args.fix_app_icon:
                   fix_app_icon(root, args.dry_run)
+              if not args.no_legacy_cxx:
+                  fix_legacy_cxx_sources(root, args.dry_run)
               if plist.is_file():
                   fix_info_plist(plist, args.dry_run)
               else:
@@ -706,6 +752,12 @@ jobs:
       # 关键参数说明：
       #   ARCHS=arm64            : 工程里写的是 armv7/armv7s/arm64，现代 SDK 已无 32 位
       #   IPHONEOS_DEPLOYMENT_TARGET : 工程写的是 8.0，现代 Xcode 会直接报错拒绝
+      #   CLANG_CXX_LANGUAGE_STANDARD=gnu++11 :
+      #       clang 16 把默认 C++ 标准从 gnu++98 改成了 gnu++17。这份 2010 年的代码
+      #       因此撞上 C++17 移除的 register 关键字等一堆新错误。固定成 gnu++11，
+      #       既能避开 C++17 的移除项，又不会像 gnu++98 那样和现代 SDK 头文件冲突。
+      #   -Wno-c++11-narrowing   : PVRTMathTable.h 里有 const int[] = {0xFFFFF952,...}
+      #       这种十六进制表，C++11 起「窄化转换」是错误（这就是第一次构建失败的原因）
       #   CODE_SIGNING_ALLOWED=NO: 我们就是要未签名的包，签名交给 Sideloadly
       #   -target Eden           : 工程里没有共享 scheme，只能用 target
       #   -Wno-error=...         : 老代码在现代 clang 下会被提升为错误的那些警告
@@ -715,9 +767,12 @@ jobs:
           CONFIGURATION: ${{ inputs.configuration || 'Release' }}
           DEPLOYMENT_TARGET: ${{ inputs.deployment_target || '16.0' }}
           BUNDLE_ID: ${{ inputs.bundle_id || 'com.edenworldbuilder.sideload' }}
+          CXX_STANDARD: ${{ inputs.cxx_standard || 'gnu++11' }}
         run: |
           set -o pipefail
           EXTRA_CFLAGS="-DNS_BLOCK_ASSERTIONS=1"
+          EXTRA_CFLAGS="$EXTRA_CFLAGS -Wno-c++11-narrowing -Wno-error=c++11-narrowing"
+          EXTRA_CFLAGS="$EXTRA_CFLAGS -Wno-deprecated-register -Wno-error=deprecated-register"
           EXTRA_CFLAGS="$EXTRA_CFLAGS -Wno-error=implicit-function-declaration"
           EXTRA_CFLAGS="$EXTRA_CFLAGS -Wno-error=implicit-int"
           EXTRA_CFLAGS="$EXTRA_CFLAGS -Wno-error=int-conversion"
@@ -732,9 +787,9 @@ jobs:
             -target Eden \
             -configuration "$CONFIGURATION" \
             -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
             SYMROOT="$PWD/build" \
             IPHONEOS_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+            CLANG_CXX_LANGUAGE_STANDARD="$CXX_STANDARD" \
             ARCHS=arm64 \
             VALID_ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=NO \
