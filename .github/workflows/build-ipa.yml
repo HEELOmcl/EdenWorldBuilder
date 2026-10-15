@@ -42,6 +42,10 @@ on:
         description: "自动补齐 AppIcon 资源目录里空着的图标尺寸（建议保持勾选）"
         type: boolean
         default: true
+      screen_fix:
+        description: "把游戏画面固定在 568x320 居中显示，修复大屏手机上的拉伸与触控失灵（建议保持勾选）"
+        type: boolean
+        default: true
       adhoc_sign:
         description: "仅当 Sideloadly 拒绝安装未签名包时勾选：打包前做 ad-hoc 签名"
         type: boolean
@@ -88,6 +92,7 @@ jobs:
         env:
           DISABLE_FLURRY: ${{ inputs.disable_flurry }}
           FIX_APP_ICON: ${{ inputs.fix_app_icon }}
+          SCREEN_FIX: ${{ inputs.screen_fix }}
         run: |
           cat > "$RUNNER_TEMP/patch_project.py" <<'PATCH_EOF'
           #!/usr/bin/env python3
@@ -702,6 +707,96 @@ jobs:
                     % (total, ", ".join(changed) if changed else "no file"))
 
 
+          SCREEN_FIX_MARK = "Eden-IPA-KIT screen geometry fix"
+
+          # The whole codebase is written for a 568x320 point window (4-inch iPhone):
+          #   * EAGLView.mm     sets SCREEN_WIDTH=568 / SCREEN_HEIGHT=320 and forces IS_WIDESCREEN,
+          #                     and a 2x screen makes it take the IS_IPAD path, so the menu ortho
+          #                     is SCREEN_WIDTH*2 x SCREEN_HEIGHT*2 = 1136x640 pixels
+          #   * Hud.mm          lays every button rect out in that 568x320 space
+          #   * Input.mm        feeds raw view points straight into those rects (scr_width/scr_height
+          #                     = 568x320), so touch coordinates must be in 0..568 x 0..320
+          # On a 4-inch device the view is exactly 568x320 points, the drawable is 1136x640 pixels
+          # and everything lines up 1:1.  On an iPhone 13 (844x390 points) the window is much bigger,
+          # which stretches the 16:9 image to 19.5:9 and puts touch points outside the UI's coordinate
+          # space - the app looks distorted and stops responding.  Pinning the GL view to a centred
+          # 568x320 rect reproduces the letterboxing iOS used to apply automatically.
+          LAYOUT_SUBVIEWS_OLD = """- (void)layoutSubviews
+          {
+              // The framebuffer will be re-created at the beginning of the next setFramebuffer method call.
+              [self deleteFramebuffer];
+          }"""
+
+          LAYOUT_SUBVIEWS_NEW = """- (void)layoutSubviews
+          {
+              /* Eden-IPA-KIT screen geometry fix.
+                 This codebase is written for a 568x320 point window (see the header comment in
+                 patch_project.py).  On anything larger the image is stretched and touch points
+                 fall outside the coordinate space the HUD hit-tests in.  Pin the GL surface to a
+                 centred 568x320 rect so the drawable is 1136x640 pixels (matching the menu ortho
+                 projection) and touches arrive in 0..568 x 0..320.  On a 4-inch device the host
+                 is already 568x320, so this is a no-op. */
+              if (UI_USER_INTERFACE_IDIOM() != UIUserInterfaceIdiomPad && self.superview) {
+                  self.autoresizingMask = UIViewAutoresizingNone;
+                  CGSize host = self.superview.bounds.size;
+                  CGFloat want_w = IPHONE5_WIDTH, want_h = IPHONE_HEIGHT;
+                  if (host.width < host.height) { want_w = IPHONE_HEIGHT; want_h = IPHONE5_WIDTH; }
+                  CGRect want = CGRectMake((CGFloat)(int)((host.width - want_w) / 2.0f),
+                                           (CGFloat)(int)((host.height - want_h) / 2.0f),
+                                           want_w, want_h);
+                  if (!CGRectEqualToRect(self.frame, want)) {
+                      self.frame = want;
+                      printf("Eden: letterboxing %0.fx%0.f -> %0.fx%0.f\\n",
+                             (double)host.width, (double)host.height, (double)want_w, (double)want_h);
+                  }
+              }
+              // The framebuffer will be re-created at the beginning of the next setFramebuffer method call.
+              [self deleteFramebuffer];
+          }"""
+
+          WINDOW_BG_OLD = "    [self.window setRootViewController:viewController];"
+          WINDOW_BG_NEW = """    [self.window setRootViewController:viewController];
+              /* Eden-IPA-KIT screen geometry fix: the game surface is smaller than the window,
+                 so make the letterbox bars black instead of the default white. */
+              self.window.backgroundColor = [UIColor blackColor];"""
+
+
+          def fix_legacy_screen_geometry(project_dir: Path, dry: bool):
+              """Pin the GL surface (and the letterbox colour) for screens bigger than 4 inches."""
+              view = project_dir / "Classes" / "EAGLView.mm"
+              delegate = project_dir / "Classes" / "EdenAppDelegate.mm"
+              changed = []
+
+              if view.is_file():
+                  src = read(view)
+                  if SCREEN_FIX_MARK in src:
+                      print("- screen geometry: EAGLView.mm already patched")
+                  elif LAYOUT_SUBVIEWS_OLD in src:
+                      print("- screen geometry: pinning EAGLView to a centred 568x320 rect")
+                      changed.append(view.name)
+                      if not dry:
+                          write(view, src.replace(LAYOUT_SUBVIEWS_OLD, LAYOUT_SUBVIEWS_NEW, 1))
+                  else:
+                      print("- screen geometry: WARNING could not find -layoutSubviews in EAGLView.mm")
+              else:
+                  print("- screen geometry: EAGLView.mm not found")
+
+              if delegate.is_file():
+                  src = read(delegate)
+                  if SCREEN_FIX_MARK in src:
+                      print("- screen geometry: EdenAppDelegate.mm already patched")
+                  elif WINDOW_BG_OLD in src:
+                      print("- screen geometry: setting the letterbox colour to black")
+                      changed.append(delegate.name)
+                      if not dry:
+                          write(delegate, src.replace(WINDOW_BG_OLD, WINDOW_BG_NEW, 1))
+                  else:
+                      print("- screen geometry: WARNING could not find the root-view-controller line")
+              else:
+                  print("- screen geometry: EdenAppDelegate.mm not found")
+              return changed
+
+
           def disable_flurry(project_dir: Path, text: str, dry: bool):
               refs = parse_file_references(text)
               victims_ref = {i for i, r in refs.items()
@@ -751,6 +846,8 @@ jobs:
                               help="do not touch the AppIcon asset catalogue")
               ap.add_argument("--no-legacy-cxx", action="store_true",
                               help="do not strip the C++17-removed 'register' keyword")
+              ap.add_argument("--no-screen-fix", action="store_true",
+                              help="do not pin the GL view to the 568x320 point window it assumes")
               ap.add_argument("--dry-run", action="store_true", help="report without writing")
               args = ap.parse_args()
 
@@ -778,6 +875,8 @@ jobs:
               if not args.no_legacy_cxx:
                   fix_legacy_cxx_sources(root, args.dry_run)
               fix_legacy_uikit_enums(root, args.dry_run)
+              if not args.no_screen_fix:
+                  fix_legacy_screen_geometry(root, args.dry_run)
               if plist.is_file():
                   fix_info_plist(plist, args.dry_run)
               else:
@@ -812,6 +911,7 @@ jobs:
           ARGS=""
           if [ "$DISABLE_FLURRY" = "true" ]; then ARGS="--disable-flurry"; fi
           if [ "$FIX_APP_ICON" = "false" ]; then ARGS="$ARGS --no-fix-app-icon"; fi
+          if [ "$SCREEN_FIX" = "false" ]; then ARGS="$ARGS --no-screen-fix"; fi
           python3 "$RUNNER_TEMP/patch_project.py" --project-dir . $ARGS
 
       # xcodebuild -list 会真正解析工程文件；解析失败会在这里立刻停下，
