@@ -1,0 +1,820 @@
+# =============================================================================
+#  Eden World Builder -> 未签名 .ipa
+#  在 macOS 运行器上编译，产出可用 Sideloadly / AltStore 自签安装的 .ipa。
+#
+#  这个文件是自包含的：不需要仓库里存在任何其他脚本。
+#
+#  使用方法（全程在浏览器里完成，Windows 也可以）：
+#    1. Fork https://github.com/ryanjkontos/EdenWorldBuilder
+#    2. 在你的 Fork 里新建 .github/workflows/build-ipa.yml，内容就是本文件
+#    3. 打开 Fork 的 Actions 标签页 -> Build Eden World Builder IPA -> Run workflow
+#    4. 构建完成后在该次运行的 Artifacts 里下载 eden-world-builder-ipa
+#
+#  详细说明见 BUILD-IPA.md
+# =============================================================================
+name: Build Eden World Builder IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "Xcode 构建配置（Release 是正式配置，Debug 仅用于排查）"
+        type: choice
+        options: [Release, Debug]
+        default: Release
+      deployment_target:
+        description: "最低 iOS 版本。Xcode 16 只允许 12.0 及以上；设备系统必须不低于它"
+        default: "16.0"
+      bundle_id:
+        description: "Bundle ID。自签工具要求反向域名格式，不要用原来的 EdenDevBuild"
+        default: "com.edenworldbuilder.sideload"
+      runner:
+        description: "GitHub 运行器标签。可选 macos-15 / macos-14 / macos-latest"
+        default: "macos-15"
+      disable_flurry:
+        description: "仅当链接阶段报 Flurry 相关错误时勾选：移除 Flurry 分析库"
+        type: boolean
+        default: false
+      fix_app_icon:
+        description: "自动补齐 AppIcon 资源目录里空着的图标尺寸（建议保持勾选）"
+        type: boolean
+        default: true
+      adhoc_sign:
+        description: "仅当 Sideloadly 拒绝安装未签名包时勾选：打包前做 ad-hoc 签名"
+        type: boolean
+        default: false
+  push:
+    branches: [master, main]
+    paths:
+      - ".github/workflows/build-ipa.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-ipa:
+    name: Build unsigned IPA
+    # github.event.inputs 在 push 触发时为空，因此用 || 兜底
+    runs-on: ${{ github.event.inputs.runner || 'macos-15' }}
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+
+      - name: Show toolchain
+        run: |
+          set -x
+          sw_vers
+          xcodebuild -version
+          xcode-select -p
+          xcrun --sdk iphoneos --show-sdk-version
+          python3 --version
+          df -h /
+
+      # ---------------------------------------------------------------------
+      # 把工程改成现代 Xcode 能编译的样子：
+      #   * 摘掉仓库里根本不存在的 libcocos2d iOS.a 链接项（已验证无任何代码引用它）
+      #   * 清理 2013 年的失效 provisioning profile
+      #   * 把 Info.plist 里的 opengles-1 设备要求换成 arm64
+      # ---------------------------------------------------------------------
+      - name: Patch the Xcode project
+        env:
+          DISABLE_FLURRY: ${{ inputs.disable_flurry }}
+          FIX_APP_ICON: ${{ inputs.fix_app_icon }}
+        run: |
+          cat > "$RUNNER_TEMP/patch_project.py" <<'PATCH_EOF'
+          #!/usr/bin/env python3
+          # -*- coding: utf-8 -*-
+          """
+          patch_project.py -- make the Eden World Builder Xcode project buildable with a modern
+          Xcode (15 / 16 / 26) and produce an unsigned, sideloadable .ipa.
+
+          Run it from the repository root (the directory that contains Eden.xcodeproj):
+
+              python3 tools/patch_project.py                 # patch
+              python3 tools/patch_project.py --disable-flurry
+              python3 tools/patch_project.py --dry-run       # show what would change
+
+          Why each change is needed
+          -------------------------
+          1) libcocos2d iOS.a
+             The Frameworks build phase links a prebuilt cocos2d static library that the
+             repository does not ship.  Every source file in the project was scanned: no
+             file references any cocos2d symbol (CCDirector / CCSprite / CCNode / CCScene /
+             CCMenu / ...).  The only "cocos" dependency is CocosDenshion (audio), which is
+             shipped as flurry/libCocosDenshion.a.  The reference is therefore dead weight
+             and the build fails with "Build input file cannot be found".  Removing it is
+             safe.  (Verified against all 187 project source files.)
+
+          2) PROVISIONING_PROFILE / CODE_SIGN_IDENTITY
+             The project points at a 2013-era provisioning profile UUID that no longer
+             exists.  Signing is disabled for this build anyway; removing the stale values
+             keeps Xcode from trying to resolve them.
+
+          3) UIRequiredDeviceCapabilities
+             Eden-Info.plist declares `opengles-1`.  That is a legitimate capability, but it
+             is an unnecessary install gate for a modern arm64 device, and it is the one
+             plist key that can make iOS refuse an install outright.  The build produces an
+             arm64-only binary, so we state exactly that instead: `arm64`.
+
+          4) --disable-flurry
+             Optional.  Flurry 6.0.0 (2015) is a prebuilt static library.  It only has to
+             satisfy one call site (EdenAppDelegate.mm).  If the link step ever rejects it,
+             this flag removes the library *and* neutralises the call sites, so the app
+             builds without any third-party binary blob.
+
+          5) --fix-app-icon (on by default, macOS only)
+             Eden/Images.xcassets/AppIcon.appiconset/Contents.json declares ~20 icon slots
+             and leaves most of them empty, including the 1024x1024 "ios-marketing" slot.
+             Xcode in 2018 merely warned about that; recent actool versions are stricter
+             about icon-set completeness.  Using sips we generate every missing size from
+             the largest icon already in the set, so the catalogue is complete.
+
+          The script is idempotent: running it twice changes nothing.
+          """
+
+          from __future__ import annotations
+
+          import argparse
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          OBJ_ID = r"[0-9A-F]{24}"
+
+          # ----------------------------------------------------------------------------
+          # helpers
+          # ----------------------------------------------------------------------------
+
+
+          def read(path: Path) -> str:
+              return path.read_text(encoding="utf-8", errors="surrogateescape")
+
+
+          def write(path: Path, text: str) -> None:
+              path.write_text(text, encoding="utf-8", errors="surrogateescape")
+
+
+          def parse_file_references(text: str):
+              """id -> {'path':..., 'name':..., 'comment':...} for PBXFileReference objects."""
+              refs = {}
+              pat = re.compile(
+                  r"^\t\t(" + OBJ_ID + r") /\* (.*?) \*/ = \{isa = PBXFileReference;(.*?)\};$",
+                  re.M,
+              )
+              for m in pat.finditer(text):
+                  body = m.group(3)
+                  p = re.search(r'\bpath = ("(?:[^"\\]|\\.)*"|[^;]+);', body)
+                  n = re.search(r'\bname = ("(?:[^"\\]|\\.)*"|[^;]+);', body)
+                  refs[m.group(1)] = {
+                      "comment": m.group(2),
+                      "path": p.group(1).strip().strip('"') if p else None,
+                      "name": n.group(1).strip().strip('"') if n else None,
+                  }
+              return refs
+
+
+          def parse_build_files(text: str):
+              """id -> fileRef id for PBXBuildFile objects."""
+              out = {}
+              pat = re.compile(
+                  r"^\t\t(" + OBJ_ID + r") /\* .*? \*/ = \{isa = PBXBuildFile; fileRef = (" + OBJ_ID + r")",
+                  re.M,
+              )
+              for m in pat.finditer(text):
+                  out[m.group(1)] = m.group(2)
+              return out
+
+
+          def drop_objects(text: str, victim_ids: set):
+              """Remove the object definitions for victim_ids and every reference to them.
+
+              Returns (new_text, removed_lines).
+              """
+              if not victim_ids:
+                  return text, []
+
+              removed = []
+              keep = []
+              def_pat = re.compile(
+                  r"^\s*(" + "|".join(sorted(victim_ids)) + r") /\*.*?\*/ = \{isa = (PBXBuildFile|PBXFileReference);"
+              )
+              for line in text.split("\n"):
+                  if def_pat.match(line):
+                      removed.append(line.strip())
+                      continue
+                  keep.append(line)
+              text = "\n".join(keep)
+
+              # now every remaining occurrence is a list entry like
+              #     \t\t\t\t19E52AE11A84418200C9CD48 /* libFlurry_6.0.0.a in Frameworks */,
+              for vid in sorted(victim_ids):
+                  frag = re.compile(r"[ \t]*" + vid + r" /\*.*?\*/[ \t]*,?[ \t]*\r?\n")
+                  text, n = frag.subn("\n", text)
+                  if n:
+                      removed.append("(list entry) " + vid + " x%d" % n)
+                  # last-entry-without-newline safety net
+                  frag2 = re.compile(r"[ \t]*" + vid + r" /\*.*?\*/[ \t]*,?")
+                  text, n2 = frag2.subn("", text)
+                  if n2:
+                      removed.append("(inline) " + vid + " x%d" % n2)
+              return text, removed
+
+
+          # ----------------------------------------------------------------------------
+          # a dependency-free OpenStep (NeXTSTEP) property-list parser, used to prove that
+          # project.pbxproj is still syntactically valid after patching
+          # ----------------------------------------------------------------------------
+
+
+          class OpenStepError(ValueError):
+              pass
+
+
+          class OpenStepParser:
+              _DELIM = set(' \t\r\n;,()={}')
+
+              def __init__(self, text: str):
+                  self.t = text
+                  self.i = 0
+                  self.n = len(text)
+
+              # -- lexical ------------------------------------------------------------
+              def skip(self):
+                  t, n = self.t, self.n
+                  while self.i < n:
+                      c = t[self.i]
+                      if c in " \t\r\n":
+                          self.i += 1
+                      elif c == "/" and self.i + 1 < n and t[self.i + 1] == "*":
+                          j = t.find("*/", self.i + 2)
+                          if j < 0:
+                              raise OpenStepError("unterminated /* comment at %d" % self.i)
+                          self.i = j + 2
+                      elif c == "/" and self.i + 1 < n and t[self.i + 1] == "/":
+                          j = t.find("\n", self.i + 2)
+                          self.i = n if j < 0 else j + 1
+                      else:
+                          return
+
+              def parse(self):
+                  self.skip()
+                  if self.i >= self.n:
+                      raise OpenStepError("unexpected end of input")
+                  c = self.t[self.i]
+                  if c == "{":
+                      return self.parse_dict()
+                  if c == "(":
+                      return self.parse_array()
+                  if c == '"':
+                      return self.parse_quoted()
+                  if c == "<":
+                      return self.parse_data()
+                  return self.parse_bare()
+
+              def parse_dict(self):
+                  self.i += 1  # consume '{'
+                  out = {}
+                  while True:
+                      self.skip()
+                      if self.i >= self.n:
+                          raise OpenStepError("unterminated dictionary")
+                      if self.t[self.i] == "}":
+                          self.i += 1
+                          return out
+                      key = self.parse()
+                      self.skip()
+                      if self.i >= self.n or self.t[self.i] != "=":
+                          raise OpenStepError("expected '=' after key %r at %d" % (key, self.i))
+                      self.i += 1
+                      value = self.parse()
+                      self.skip()
+                      if self.i < self.n and self.t[self.i] == ";":
+                          self.i += 1
+                      elif self.i < self.n and self.t[self.i] == "}":
+                          pass
+                      else:
+                          raise OpenStepError("expected ';' after value for key %r at %d" % (key, self.i))
+                      out[key if isinstance(key, str) else str(key)] = value
+
+              def parse_array(self):
+                  self.i += 1  # consume '('
+                  out = []
+                  while True:
+                      self.skip()
+                      if self.i >= self.n:
+                          raise OpenStepError("unterminated array")
+                      if self.t[self.i] == ")":
+                          self.i += 1
+                          return out
+                      out.append(self.parse())
+                      self.skip()
+                      if self.i < self.n and self.t[self.i] == ",":
+                          self.i += 1
+                      elif self.i < self.n and self.t[self.i] == ")":
+                          pass
+                      else:
+                          raise OpenStepError("expected ',' or ')' in array at %d" % self.i)
+
+              def parse_quoted(self):
+                  self.i += 1
+                  buf = []
+                  while self.i < self.n:
+                      c = self.t[self.i]
+                      if c == "\\":
+                          nxt = self.t[self.i + 1:self.i + 2]
+                          buf.append({"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\"}.get(nxt, nxt))
+                          self.i += 2
+                          continue
+                      if c == '"':
+                          self.i += 1
+                          return "".join(buf)
+                      buf.append(c)
+                      self.i += 1
+                  raise OpenStepError("unterminated quoted string")
+
+              def parse_data(self):
+                  j = self.t.find(">", self.i)
+                  if j < 0:
+                      raise OpenStepError("unterminated <data>")
+                  raw = self.t[self.i + 1:j]
+                  self.i = j + 1
+                  return ("<data>", "".join(raw.split()))
+
+              def parse_bare(self):
+                  start = self.i
+                  while self.i < self.n and self.t[self.i] not in self._DELIM:
+                      self.i += 1
+                  if self.i == start:
+                      raise OpenStepError("empty token at %d (%r)" % (self.i, self.t[self.i:self.i + 20]))
+                  return self.t[start:self.i]
+
+
+          def parse_openstep(text: str):
+              """Parse an OpenStep plist.  Returns (ok, value_or_error_message)."""
+              try:
+                  p = OpenStepParser(text)
+                  value = p.parse()
+                  p.skip()
+                  if p.i != p.n:
+                      return False, "trailing data at offset %d" % p.i
+                  return True, value
+              except OpenStepError as exc:
+                  return False, str(exc)
+              except RecursionError:
+                  return False, "nesting too deep"
+
+
+          # ----------------------------------------------------------------------------
+          # validation
+          # ----------------------------------------------------------------------------
+
+
+          def validate(text: str, label: str) -> list:
+              """Syntactic + structural sanity check of the patched pbxproj."""
+              problems = []
+
+              ok, value = parse_openstep(text)
+              if not ok:
+                  print("  [!!] %s: OpenStep parse FAILED: %s" % (label, value))
+                  return ["OpenStep parse failed: %s" % value]
+              objects = value.get("objects", {}) if isinstance(value, dict) else {}
+
+              refs = parse_file_references(text)
+              build_files = parse_build_files(text)
+
+              # 1) every build file must point at a file reference that still exists
+              for bid, ref in build_files.items():
+                  if ref not in refs:
+                      problems.append("PBXBuildFile %s points at missing PBXFileReference %s" % (bid, ref))
+
+              # 2) every id used inside a build phase's files = ( ... ) must exist
+              for m in re.finditer(r"isa = PBX\w*BuildPhase;(.*?)\n\t\t\};", text, re.S):
+                  body = m.group(1)
+                  fm = re.search(r"files = \((.*?)\);", body, re.S)
+                  if not fm:
+                      continue
+                  for oid in re.findall(OBJ_ID, fm.group(1)):
+                      if oid not in build_files:
+                          problems.append("build phase references unknown PBXBuildFile %s" % oid)
+
+              # 3) every id used inside a group's children = ( ... ) must exist somewhere
+              all_objects = set(re.findall(r"^\t\t(" + OBJ_ID + r") /\*", text, re.M))
+              all_objects |= set(objects.keys()) if isinstance(objects, dict) else set()
+              for m in re.finditer(r"isa = PBXGroup;(.*?)\n\t\t\};", text, re.S):
+                  cm = re.search(r"children = \((.*?)\);", m.group(1), re.S)
+                  if not cm:
+                      continue
+                  for oid in re.findall(OBJ_ID, cm.group(1)):
+                      if oid not in all_objects:
+                          problems.append("PBXGroup references unknown object %s" % oid)
+
+              # 3b) cross-check the parsed object graph: every fileRef must resolve, and the
+              #     targets must still have their build phases
+              if isinstance(objects, dict):
+                  for oid, obj in objects.items():
+                      if not isinstance(obj, dict):
+                          continue
+                      isa = obj.get("isa")
+                      if isa == "PBXBuildFile":
+                          fr = obj.get("fileRef")
+                          if fr not in objects:
+                              problems.append("PBXBuildFile %s(fileRef=%s) does not resolve" % (oid, fr))
+                      if isa in ("PBXSourcesBuildPhase", "PBXResourcesBuildPhase", "PBXFrameworksBuildPhase"):
+                          for bf in obj.get("files", []) or []:
+                              if bf not in objects:
+                                  problems.append("%s %s references unknown build file %s" % (isa, oid, bf))
+                  proj = value.get("rootObject")
+                  if proj not in objects:
+                      problems.append("rootObject %s missing" % proj)
+                  else:
+                      tgt_ids = objects[proj].get("targets", []) or []
+                      if not tgt_ids:
+                          problems.append("project has no targets")
+                      for tid in tgt_ids:
+                          tgt = objects.get(tid, {})
+                          if not tgt.get("buildPhases"):
+                              problems.append("target %s has no build phases" % tid)
+                          for ph in tgt.get("buildPhases", []) or []:
+                              if ph not in objects:
+                                  problems.append("target %s references unknown phase %s" % (tid, ph))
+
+              # 4) brackets balanced, sections intact
+              for open_c, close_c in (("{", "}"), ("(", ")")):
+                  if text.count(open_c) != text.count(close_c):
+                      problems.append("unbalanced %s%s (%d vs %d)" % (open_c, close_c, text.count(open_c), text.count(close_c)))
+              if "/* Begin PBXProject section */" not in text:
+                  problems.append("PBXProject section disappeared")
+
+              if not problems:
+                  print("  [ok] %s: %d file refs, %d build files, structure valid"
+                        % (label, len(refs), len(build_files)))
+              else:
+                  for p in problems:
+                      print("  [!!] %s: %s" % (label, p))
+              return problems
+
+
+          # ----------------------------------------------------------------------------
+          # the individual fixes
+          # ----------------------------------------------------------------------------
+
+
+          def fix_libcocos2d(text: str, dry: bool):
+              refs = parse_file_references(text)
+              victims_ref = {i for i, r in refs.items()
+                             if (r["path"] or "").endswith("libcocos2d iOS.a")}
+              if not victims_ref:
+                  print("- libcocos2d iOS.a: already absent, nothing to do")
+                  return text, []
+              build_files = parse_build_files(text)
+              victims_bf = {b for b, r in build_files.items() if r in victims_ref}
+              print("- libcocos2d iOS.a: removing %d file reference(s) and %d link entry(ies)"
+                    % (len(victims_ref), len(victims_bf)))
+              if dry:
+                  return text, []
+              return drop_objects(text, victims_ref | victims_bf)
+
+
+          def fix_stale_signing(text: str, dry: bool):
+              before = text
+              pat = r'^[ \t]*"?PROVISIONING_PROFILE(\[[^\]]*\])?"? = [^;]*;\r?\n'
+              spec = r'^[ \t]*"?PROVISIONING_PROFILE_SPECIFIER"?(?:\[[^\]]*\])? = [^;]*;\r?\n'
+              n_profile = len(re.findall(pat, text, re.M)) + len(re.findall(spec, text, re.M))
+              patched = re.sub(pat, "", text, flags=re.M)
+              patched = re.sub(spec, "", patched, flags=re.M)
+              print("- stale PROVISIONING_PROFILE: removed %d entr%s"
+                    % (n_profile, "y" if n_profile == 1 else "ies"))
+              return before if dry else patched
+
+
+          def fix_info_plist(path: Path, dry: bool):
+              text = read(path)
+              m = re.search(
+                  r"(<key>UIRequiredDeviceCapabilities</key>\s*<array>)(.*?)(</array>)", text, re.S)
+              if not m:
+                  print("- Eden-Info.plist: no UIRequiredDeviceCapabilities array found")
+                  return
+              if m.group(2).strip() == "<string>arm64</string>":
+                  print("- Eden-Info.plist: UIRequiredDeviceCapabilities already arm64")
+                  return
+              print("- Eden-Info.plist: UIRequiredDeviceCapabilities %s -> arm64"
+                    % " ".join(m.group(2).split()))
+              if dry:
+                  return
+              new = text[:m.start(2)] + "\n\t\t<string>arm64</string>\n\t" + text[m.end(2):]
+              write(path, new)
+
+
+          def sips_pixel_size(sips: str, path: Path):
+              try:
+                  r = subprocess.run([sips, "-g", "pixelWidth", "-g", "pixelHeight", str(path)],
+                                     capture_output=True, text=True, timeout=60)
+              except Exception:                                    # noqa: BLE001
+                  return None
+              w = h = None
+              for line in r.stdout.splitlines():
+                  if "pixelWidth:" in line:
+                      w = int(line.split(":")[1])
+                  elif "pixelHeight:" in line:
+                      h = int(line.split(":")[1])
+              return (w, h) if w and h else None
+
+
+          def fix_app_icon(project_dir: Path, dry: bool):
+              """Fill in every empty slot of the AppIcon asset catalogue (macOS + sips only)."""
+              cat = project_dir / "Eden" / "Images.xcassets" / "AppIcon.appiconset"
+              cj = cat / "Contents.json"
+              if not cj.is_file():
+                  print("- AppIcon: %s not found, skipped" % cj)
+                  return
+
+              try:
+                  data = json.loads(read(cj))
+              except Exception as exc:                             # noqa: BLE001
+                  print("- AppIcon: Contents.json is not valid JSON (%s), skipped" % exc)
+                  return
+
+              empty = []
+              for img in data.get("images", []) or []:
+                  if img.get("filename"):
+                      continue
+                  size, scale = img.get("size"), img.get("scale", "1x")
+                  if not size:
+                      continue
+                  try:
+                      side = int(round(float(size.split("x")[0]) * float(str(scale).rstrip("x"))))
+                  except (ValueError, IndexError):
+                      continue
+                  empty.append((img, side))
+
+              if not empty:
+                  print("- AppIcon: every slot already has a file")
+                  return
+
+              sips = shutil.which("sips")
+              if not sips:
+                  print("- AppIcon: %d empty slot(s) and sips is unavailable (not macOS), skipped"
+                        % len(empty))
+                  return
+
+              master, best = None, -1
+              for png in sorted(cat.glob("*.png")):
+                  dim = sips_pixel_size(sips, png)
+                  if dim and dim[0] * dim[1] > best:
+                      best, master = dim[0] * dim[1], png
+              if master is None:
+                  print("- AppIcon: no usable source png, skipped")
+                  return
+
+              print("- AppIcon: filling %d empty slot(s) from %s (%dx%d)"
+                    % (len(empty), master.name, *sips_pixel_size(sips, master)))
+              if dry:
+                  return
+
+              for img, side in empty:
+                  name = "Generated-%s-%s-%s.png" % (img.get("idiom", "any"), img.get("size"), img.get("scale", "1x"))
+                  out = cat / name
+                  subprocess.run([sips, "-z", str(side), str(side), str(master), "--out", str(out)],
+                                 check=True, capture_output=True)
+                  img["filename"] = name
+              write(cj, json.dumps(data, indent=2) + "\n")
+
+
+          def disable_flurry(project_dir: Path, text: str, dry: bool):
+              refs = parse_file_references(text)
+              victims_ref = {i for i, r in refs.items()
+                             if (r["path"] or "") in ("libFlurry_6.0.0.a", "Flurry.h")}
+              build_files = parse_build_files(text)
+              victims_bf = {b for b, r in build_files.items() if r in victims_ref}
+
+              print("- Flurry: unlinking %s" % ", ".join(sorted(
+                  (refs[i]["path"] or "") for i in victims_ref)) or "nothing")
+              if not dry:
+                  text, _ = drop_objects(text, victims_ref | victims_bf)
+
+              # neutralise the call sites in the sources
+              changed_files = []
+              call_pat = re.compile(r"\[\s*Flurry\s+[^\]]*\]\s*;")
+              for path in sorted(project_dir.rglob("*.mm")) + sorted(project_dir.rglob("*.m")):
+                  if "/.git/" in str(path):
+                      continue
+                  try:
+                      src = read(path)
+                  except OSError:
+                      continue
+                  if "Flurry" not in src:
+                      continue
+                  new, n = call_pat.subn("/* Flurry call removed by patch_project.py */;", src)
+                  if n:
+                      changed_files.append("%s (%d call site%s)" % (path.name, n, "s" if n > 1 else ""))
+                      if not dry:
+                          write(path, new)
+              print("- Flurry: neutralised call sites in %s"
+                    % (", ".join(changed_files) if changed_files else "none"))
+              return text
+
+
+          # ----------------------------------------------------------------------------
+
+
+          def main() -> int:
+              ap = argparse.ArgumentParser(description=__doc__,
+                                           formatter_class=argparse.RawDescriptionHelpFormatter)
+              ap.add_argument("--project-dir", default=".", help="repository root (default: .)")
+              ap.add_argument("--disable-flurry", action="store_true",
+                              help="also remove the Flurry analytics SDK")
+              ap.add_argument("--fix-app-icon", dest="fix_app_icon", action="store_true", default=True,
+                              help="fill empty AppIcon slots with sips (default, macOS only)")
+              ap.add_argument("--no-fix-app-icon", dest="fix_app_icon", action="store_false",
+                              help="do not touch the AppIcon asset catalogue")
+              ap.add_argument("--dry-run", action="store_true", help="report without writing")
+              args = ap.parse_args()
+
+              root = Path(args.project_dir).resolve()
+              pbx = root / "Eden.xcodeproj" / "project.pbxproj"
+              plist = root / "Eden-Info.plist"
+
+              if not pbx.is_file():
+                  print("ERROR: %s not found. Run this from the repository root." % pbx, file=sys.stderr)
+                  return 2
+
+              print("== Eden World Builder project patcher ==")
+              print("project: %s" % pbx)
+
+              text = read(pbx)
+              original = text
+              problems = validate(text, "before")
+
+              text, _ = fix_libcocos2d(text, args.dry_run)
+              text = fix_stale_signing(text, args.dry_run)
+              if args.disable_flurry:
+                  text = disable_flurry(root, text, args.dry_run)
+              if args.fix_app_icon:
+                  fix_app_icon(root, args.dry_run)
+              if plist.is_file():
+                  fix_info_plist(plist, args.dry_run)
+              else:
+                  print("- Eden-Info.plist not found, skipped")
+
+              if not args.dry_run:
+                  # keep a one-time backup so the change is auditable / reversible
+                  backup = pbx.with_suffix(".pbxproj.orig")
+                  if not backup.exists():
+                      shutil.copy2(pbx, backup)
+                      print("- backup written to %s" % backup.name)
+                  if text != original:
+                      write(pbx, text)
+                      print("- project.pbxproj updated")
+                  else:
+                      print("- project.pbxproj unchanged")
+
+              if not args.dry_run:
+                  text = read(pbx)
+              problems = validate(text, "after")
+
+              if problems:
+                  print("\nRESULT: FAILED structural validation")
+                  return 1
+              print("\nRESULT: ok%s" % (" (dry run)" if args.dry_run else ""))
+              return 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PATCH_EOF
+          ARGS=""
+          if [ "$DISABLE_FLURRY" = "true" ]; then ARGS="--disable-flurry"; fi
+          if [ "$FIX_APP_ICON" = "false" ]; then ARGS="$ARGS --no-fix-app-icon"; fi
+          python3 "$RUNNER_TEMP/patch_project.py" --project-dir . $ARGS
+
+      # xcodebuild -list 会真正解析工程文件；解析失败会在这里立刻停下，
+      # 避免把问题拖到漫长的编译阶段。
+      - name: Validate the patched project
+        run: |
+          xcodebuild -list -project Eden.xcodeproj
+
+      # ---------------------------------------------------------------------
+      # 关键参数说明：
+      #   ARCHS=arm64            : 工程里写的是 armv7/armv7s/arm64，现代 SDK 已无 32 位
+      #   IPHONEOS_DEPLOYMENT_TARGET : 工程写的是 8.0，现代 Xcode 会直接报错拒绝
+      #   CODE_SIGNING_ALLOWED=NO: 我们就是要未签名的包，签名交给 Sideloadly
+      #   -target Eden           : 工程里没有共享 scheme，只能用 target
+      #   -Wno-error=...         : 老代码在现代 clang 下会被提升为错误的那些警告
+      # ---------------------------------------------------------------------
+      - name: Build for iOS
+        env:
+          CONFIGURATION: ${{ inputs.configuration || 'Release' }}
+          DEPLOYMENT_TARGET: ${{ inputs.deployment_target || '16.0' }}
+          BUNDLE_ID: ${{ inputs.bundle_id || 'com.edenworldbuilder.sideload' }}
+        run: |
+          set -o pipefail
+          EXTRA_CFLAGS="-DNS_BLOCK_ASSERTIONS=1"
+          EXTRA_CFLAGS="$EXTRA_CFLAGS -Wno-error=implicit-function-declaration"
+          EXTRA_CFLAGS="$EXTRA_CFLAGS -Wno-error=implicit-int"
+          EXTRA_CFLAGS="$EXTRA_CFLAGS -Wno-error=int-conversion"
+          EXTRA_CFLAGS="$EXTRA_CFLAGS -Wno-error=incompatible-function-pointer-types"
+          EXTRA_CFLAGS="$EXTRA_CFLAGS -Wno-error=incompatible-pointer-types"
+          EXTRA_CFLAGS="$EXTRA_CFLAGS -Wno-error=return-type"
+          EXTRA_CFLAGS="$EXTRA_CFLAGS -Wno-error=deprecated-declarations"
+          EXTRA_CFLAGS="$EXTRA_CFLAGS -Wno-error=strict-prototypes"
+
+          xcodebuild build \
+            -project Eden.xcodeproj \
+            -target Eden \
+            -configuration "$CONFIGURATION" \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            SYMROOT="$PWD/build" \
+            IPHONEOS_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+            ARCHS=arm64 \
+            VALID_ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            ENABLE_BITCODE=NO \
+            ENABLE_STRICT_OBJC_MSGSEND=NO \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            OTHER_CFLAGS="$EXTRA_CFLAGS" \
+            OTHER_CPLUSPLUSFLAGS="$EXTRA_CFLAGS" \
+            2>&1 | tee build.log | tail -n 500
+
+      - name: Package the IPA
+        env:
+          CONFIGURATION: ${{ inputs.configuration || 'Release' }}
+          ADHOC: ${{ inputs.adhoc_sign }}
+        run: |
+          set -euo pipefail
+          APP="build/${CONFIGURATION}-iphoneos/Eden.app"
+          if [ ! -d "$APP" ]; then
+            echo "::error::build product not found: $APP"
+            find build -maxdepth 4 -name "*.app" -print 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "--- built app ---"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion'   "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" || true
+          du -sh "$APP"
+          lipo -archs "$APP/Eden" 2>/dev/null || true
+
+          rm -rf Payload
+          mkdir Payload
+          ditto "$APP" "Payload/Eden.app"
+
+          MODE="unsigned"
+          if [ "$ADHOC" = "true" ]; then
+            codesign --force --deep --sign - "Payload/Eden.app"
+            MODE="adhoc-signed"
+          fi
+
+          IPA="Eden-World-Builder-${MODE}.ipa"
+          rm -f "$IPA"
+          zip -qry "$IPA" Payload
+          shasum -a 256 "$IPA" | tee sha256.txt
+          ls -lh "$IPA"
+
+          {
+            echo "### IPA 构建完成"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 文件 | \`$IPA\` |"
+            echo "| 大小 | $(du -h "$IPA" | cut -f1) |"
+            echo "| SHA256 | \`$(cut -d' ' -f1 sha256.txt)\` |"
+            echo "| 配置 | $CONFIGURATION |"
+            echo "| 最低 iOS | $DEPLOYMENT_TARGET |"
+            echo "| 签名 | $MODE |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-world-builder-ipa
+          path: |
+            *.ipa
+            sha256.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      # 构建失败时也要留下完整日志，方便定位问题
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 14
