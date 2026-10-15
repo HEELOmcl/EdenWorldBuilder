@@ -896,6 +896,50 @@ jobs:
                       write(view, src.replace("[self.layer setContentsScale:1.0f];",
                                               "[self.layer setContentsScale:2.0f];", 1))
                       changed.append("EAGLView.mm(contentsScale)")
+
+              # Raising contentsScale makes the framebuffer larger than the view in points, and
+              # gluUnProject - which turns a touch into a world ray - wants *viewport pixels*.
+              # The engine only compensates on its 2x-device path, so on modern 3x phones the
+              # picked block landed off by that factor: touching the centre of the screen
+              # selected the bottom-left block.  Derive the ratio from the viewport instead.
+              util = project_dir / "Classes" / "Util.mm"
+              # NOTE: this file is tab-indented, so match on whitespace rather than spaces
+              util_old = re.compile(r"^([ \t]*)winX = \(float\)mx;\n[ \t]*winY = \(float\)my;", re.M)
+              util_body = [
+                  "/* Eden-IPA-KIT widescreen fix: gluUnProject expects coordinates in viewport",
+                  "   *pixels*, but mx/my are view *points*.  The 2x-device path at the top of this",
+                  "   function scales them for exactly that reason; on a modern 3x phone the",
+                  "   !IS_IPAD path is taken and the framebuffer is contentsScale times the point",
+                  "   size, so derive the ratio from the viewport rather than assuming 1:1. */",
+                  "if (!IS_IPAD && SCREEN_WIDTH > 0.0f) {",
+                  "    float fbs = (float)viewport[2] / SCREEN_WIDTH;",
+                  "    if (fbs > 0.0f && fbs != 1.0f) {",
+                  "        mx = (int)((float)mx * fbs + 0.5f);",
+                  "        my = (int)((float)my * fbs + 0.5f);",
+                  "    }",
+                  "}",
+              ]
+
+              def _util_inject(m):
+                  ind = m.group(1)
+                  lines = [(ind + l).rstrip() if l.strip() else "" for l in util_body]
+                  lines.append(ind + "winX = (float)mx;")
+                  lines.append(ind + "winY = (float)my;")
+                  return "\n".join(lines)
+
+              if util.is_file():
+                  src = read(util)
+                  if "Eden-IPA-KIT widescreen fix" in src:
+                      print("- widescreen: Util.mm already patched")
+                  elif util_old.search(src):
+                      print("- widescreen: findWorldCoords now maps points -> viewport pixels")
+                      changed.append(util.name)
+                      if not dry:
+                          write(util, util_old.sub(_util_inject, src, count=1))
+                  else:
+                      print("- widescreen: WARNING could not find winX/winY in Util.mm")
+              else:
+                  print("- widescreen: Util.mm not found")
               return changed
 
 
