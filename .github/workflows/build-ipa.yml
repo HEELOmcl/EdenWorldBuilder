@@ -646,13 +646,16 @@ jobs:
           # but as distinct types, so passing them to the modern APIs is a hard error in
           # Objective-C++ (it is only a warning in plain Objective-C).  The enumerator values
           # are identical, so this rename is behaviour preserving.
+          #
+          # Note the asymmetry: the *type* is NSLineBreakMode but the *enumerators* drop
+          # "Mode" -- NSLineBreakByWordWrapping, not NSLineBreakModeByWordWrapping.
           LEGACY_UIKIT_ENUMS = [
-              ("UILineBreakModeWordWrap", "NSLineBreakModeByWordWrapping"),
-              ("UILineBreakModeCharacterWrap", "NSLineBreakModeByCharWrapping"),
-              ("UILineBreakModeClip", "NSLineBreakModeByClipping"),
-              ("UILineBreakModeHeadTruncation", "NSLineBreakModeByTruncatingHead"),
-              ("UILineBreakModeTailTruncation", "NSLineBreakModeByTruncatingTail"),
-              ("UILineBreakModeMiddleTruncation", "NSLineBreakModeByTruncatingMiddle"),
+              ("UILineBreakModeWordWrap", "NSLineBreakByWordWrapping"),
+              ("UILineBreakModeCharacterWrap", "NSLineBreakByCharWrapping"),
+              ("UILineBreakModeClip", "NSLineBreakByClipping"),
+              ("UILineBreakModeHeadTruncation", "NSLineBreakByTruncatingHead"),
+              ("UILineBreakModeTailTruncation", "NSLineBreakByTruncatingTail"),
+              ("UILineBreakModeMiddleTruncation", "NSLineBreakByTruncatingMiddle"),
               ("UILineBreakMode", "NSLineBreakMode"),
               ("UITextAlignmentLeft", "NSTextAlignmentLeft"),
               ("UITextAlignmentCenter", "NSTextAlignmentCenter"),
