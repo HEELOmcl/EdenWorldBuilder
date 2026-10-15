@@ -1122,7 +1122,7 @@ jobs:
           ls -lh "$IPA"
 
           {
-            echo "### IPA 构建完成（$BUILD_MODE）"
+            echo "### IPA build finished (${BUILD_MODE})"
             echo ""
             echo "| 项目 | 值 |"
             echo "| --- | --- |"
